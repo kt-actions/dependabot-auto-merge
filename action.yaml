@@ -1,27 +1,69 @@
-name: Template
-description: 'Template for creating new actions'
+name: Auto-merge Dependabot PRs
+description: Generate changesets for Dependabot PRs and auto-merge them if the update type is patch or minor.
 
 inputs:
-  name:
-    description: 'Your name'
-    required: true
-    default: 'World'
+  app-id:
+    description: 'GitHub App ID used to create a token and submit changes'
+  private-key:
+    description: 'GitHub App private key used to create a token and submit changes'
 
 outputs:
-  greeting:
-    description: 'The greeting message'
-    value: ${{ steps.hello.outputs.message }}
+  updated-dependencies-json:
+    description: 'Json array of updated dependencies'
+    value: ${{ steps.metadata.outputs.updated-dependencies-json }}
+  changesets-json:
+    description: 'Json array of changeset files created or updated'
+    value: ${{ steps.generate-changesets.outputs.changesets-json }}
 
 runs:
   using: 'composite'
   steps:
-    - id: echo
-      run: ${{ tojson(inputs) }}
-      shell: cat {0}
-
-    - run: echo "message='Hello ${{ inputs.name }}'" >> "$GITHUB_OUTPUT"
+    # Check if we are in the Dependabot PR context if not, fail the action
+    - if: github.event.pull_request.user.login != 'dependabot[bot]'
       shell: bash
-      id: hello
+      run: |
+        echo "This action is only for Dependabot PRs"
+        exit 1
 
-    - run: echo "Hello ${{ steps.hello.outputs.message }}"
+    - id: app-token
+      uses: kt-actions/create-github-app-token@v1
+      with:
+        app-id: ${{ inputs.app-id }}
+        private-key: ${{ inputs.private-key }}
+        configure-git: true
+
+    - id: metadata
+      uses: dependabot/fetch-metadata@v2
+      with:
+        github-token: ${{ steps.app-token.outputs.token }}
+
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.head_ref }}
+        token: ${{ steps.app-token.outputs.token }}
+
+    - uses: kt-actions/dependabot-generate-changesets@v1
+      with:
+        updated-dependencies-json: ${{ tojson(steps.metadata.outputs.updated-dependencies-json) }}
+
+    - run: |
+        # Check if there are any changes to commit in the .changeset directory
+        if [ -z "$(git status --porcelain)" ]; then
+          echo "No changes to commit"
+        else
+          git add .changeset
+          git commit -m "Add changesets for Dependabot PR"
+          git push
+        fi
       shell: bash
+      env:
+        GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+
+    - if: |
+        (steps.metadata.outputs.update-type == 'version-update:semver-minor' ||
+          steps.metadata.outputs.update-type == 'version-update:semver-patch')
+      run: gh pr merge --auto --squash "$PR_URL"
+      shell: bash
+      env:
+        PR_URL: ${{github.event.pull_request.html_url}}
+        GH_TOKEN: ${{ steps.app-token.outputs.token }}
